@@ -1,0 +1,117 @@
+#!/bin/bash
+
+param=""
+while getopts p: opt ; do
+  case "$opt" in
+    p) param=$OPTARG;;
+  esac
+done
+
+if test -r $param ; then
+  source $param
+else
+  echo "Error: $param does not exist"
+  exit 1
+fi
+
+echo "ECUTOFF= " ${ECUTOFF}
+echo "CHARGE= " ${CHARGE}
+echo "TENSOR= " ${TENSOR}
+echo "DPx= " ${DPx}
+echo "DPy= " ${DPy}
+echo "DPz= " ${DPz}
+echo "VREF= " ${VREF}
+echo "VDEF= " ${VDEF}
+
+#check the existance of the inputfiles
+if ! test -e ${VREF} ; then
+  echo "Error: ${VREF} does not exist!"
+  exit 2
+fi
+
+if ! test -e ${VDEF} ; then
+  echo "Error: ${VDEF} does not exist!"
+  exit 2
+fi
+
+# unzip the files if needed
+w=$(file -i ${VREF} | awk '{print $2;}')
+if test "${w}" = "application/x-gzip;" ; then
+  echo "Unzip..."
+  gzip -d ${VREF}
+  VREF=${VREF%%.gz}
+fi 
+
+w=$(file -i ${VDEF} | awk '{print $2;}')
+if test "${w}" = "application/x-gzip;" ; then
+  echo "Unzip..."
+  gzip -d ${VDEF}
+  VDEF=${VDEF%%.gz}
+fi 
+
+#delete the line contains the chemical IDs
+w=$(cat ${VREF} | awk '{if(NR==7) print $1; if(NR>7) exit 0}' | awk '{print substr($1,0,1);}')
+if test $(awk -v s="${w}" 'BEGIN{print index("cCdD", s)}') -eq 0 ; then
+  chmod u+w ${VREF}
+  sed -i '6d' ${VREF}
+fi
+
+w=$(cat ${VDEF} | awk '{if(NR==7) print $1; if(NR>7) exit 0}' | awk '{print substr($1,0,1);}')
+if test $(awk -v s="${w}" 'BEGIN{print index("cCdD", s)}') -eq 0 ; then
+  chmod u+w ${VDEF}
+  sed -i '6d' ${VDEF}
+fi
+
+#calculate correction (without C)
+sxdefectalign --ecut ${ECUTOFF} --charge ${CHARGE} --tensor "${TENSOR}" --pos "{${DPx}, ${DPy}, ${DPz}}" --relative --vref ${VREF} --vdef ${VDEF} --vasp
+cat vline-eV-a0.dat | awk '{if(NF==3) print $1 " " $3;}' > srpotx.dat
+cat vline-eV-a1.dat | awk '{if(NF==3) print $1 " " $3;}' > srpoty.dat
+cat vline-eV-a2.dat | awk '{if(NF==3) print $1 " " $3;}' > srpotz.dat
+
+#determine C parameter
+
+get_c_param() {
+  awk -v dp="$2" '
+  {
+      val[NR] = $2
+      lines = NR
+  }
+  END {
+      far_frac = dp + 0.5
+      if (far_frac > 1.0) far_frac -= 1.0
+
+      mid_idx = int(far_frac * lines)
+      if (mid_idx == 0) mid_idx = lines
+
+      window = int(lines / 20)
+      if (window < 1) window = 1
+
+      sum = 0
+      count = 0
+
+      for (i = 1; i <= lines; i++) {
+          dist = i - mid_idx
+          if (dist < 0) dist = -dist
+          if (dist > lines/2) dist = lines - dist
+
+          if (dist <= window) {
+              sum += val[i]
+              count++
+          }
+      }
+      print sum/count
+  }' "$1"
+}
+
+cx=$(get_c_param srpotx.dat ${DPx})
+cy=$(get_c_param srpoty.dat ${DPy})
+cz=$(get_c_param srpotz.dat ${DPz})
+
+CC=$(awk -v cx="${cx}" -v cy="${cy}" -v cz="${cz}" 'BEGIN{print (cx+cy+cz)/3}')
+
+#correction calculation including C parameter
+echo -e "\n\nCalculation with C parameter"
+sxdefectalign --ecut ${ECUTOFF} --charge ${CHARGE} -C ${CC} --tensor "${TENSOR}" --pos "{${DPx}, ${DPy}, ${DPz}}" --relative --vref ${VREF} --vdef ${VDEF} --vasp
+
+gzip ${VDEF}
+rm -f vline-eV-a0.dat vline-eV-a1.dat vline-eV-a2.dat srpotx.dat srpoty.dat srpotz.dat
